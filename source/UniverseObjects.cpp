@@ -7,7 +7,10 @@ Foundation, either version 3 of the License, or (at your option) any later versi
 
 Endless Sky is distributed in the hope that it will be useful, but WITHOUT ANY
 WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A
-PARTICULAR PURPOSE.  See the GNU General Public License for more details.
+PARTICULAR PURPOSE. See the GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License along with
+this program. If not, see <https://www.gnu.org/licenses/>.
 */
 
 #include "UniverseObjects.h"
@@ -18,6 +21,7 @@ PARTICULAR PURPOSE.  See the GNU General Public License for more details.
 #include "text/FontSet.h"
 #include "ImageSet.h"
 #include "Information.h"
+#include "Logger.h"
 #include "MaskManager.h"
 #include "Music.h"
 #include "PlayerInfo.h"
@@ -44,7 +48,7 @@ namespace {
 	// Log a warning for an "undefined" class object that was never loaded from disk.
 	void Warn(const string &noun, const string &name)
 	{
-		Files::LogError("Warning: " + noun + " \"" + name + "\" is referred to, but not fully defined.");
+		Logger::LogError("Warning: " + noun + " \"" + name + "\" is referred to, but not fully defined.");
 	}
 	// Class objects with a deferred definition should still get named when content is loaded.
 	template <class Type>
@@ -116,6 +120,9 @@ double UniverseObjects::GetProgress() const
 
 void UniverseObjects::FinishLoading()
 {
+	for(auto &&it : planets)
+		it.second.FinishLoading(wormholes);
+
 	// Now that all data is loaded, update the neighbor lists and other
 	// system information. Make sure that the default jump range is among the
 	// neighbor distances to be updated.
@@ -135,6 +142,22 @@ void UniverseObjects::FinishLoading()
 			[](const StartConditions &it) noexcept -> bool { return !it.IsValid(); }),
 		startConditions.end()
 	);
+
+	// Process any disabled game objects.
+	for(const auto &category : disabled)
+	{
+		if(category.first == "mission")
+			for(const string &name : category.second)
+				missions.Get(name)->NeverOffer();
+		else if(category.first == "event")
+			for(const string &name : category.second)
+				events.Get(name)->Disable();
+		else if(category.first == "person")
+			for(const string &name : category.second)
+				persons.Get(name)->NeverSpawn();
+		else
+			Logger::LogError("Unhandled \"disable\" keyword of type \"" + category.first + "\"");
+	}
 }
 
 
@@ -151,7 +174,7 @@ void UniverseObjects::Change(const DataNode &node)
 	else if(node.Token(0) == "outfitter" && node.Size() >= 2)
 		outfitSales.Get(node.Token(1))->Load(node, outfits);
 	else if(node.Token(0) == "planet" && node.Size() >= 2)
-		planets.Get(node.Token(1))->Load(node);
+		planets.Get(node.Token(1))->Load(node, wormholes);
 	else if(node.Token(0) == "shipyard" && node.Size() >= 2)
 		shipSales.Get(node.Token(1))->Load(node, ships);
 	else if(node.Token(0) == "system" && node.Size() >= 2)
@@ -164,6 +187,8 @@ void UniverseObjects::Change(const DataNode &node)
 		systems.Get(node.Token(1))->Unlink(systems.Get(node.Token(2)));
 	else if(node.Token(0) == "substitutions" && node.HasChildren())
 		substitutions.Load(node);
+	else if(node.Token(0) == "wormhole" && node.Size() >= 2)
+		wormholes.Get(node.Token(1))->Load(node);
 	else
 		node.PrintTrace("Error: Invalid \"event\" data:");
 }
@@ -180,6 +205,12 @@ void UniverseObjects::UpdateSystems()
 		if(it.first.empty() || it.second.Name().empty())
 			continue;
 		it.second.UpdateSystem(systems, neighborDistances);
+
+		// If there were changes to a system there might have been a change to a legacy
+		// wormhole which we must handle.
+		for(const auto &object : it.second.Objects())
+			if(object.GetPlanet())
+				planets.Get(object.GetPlanet()->TrueName())->FinishLoading(wormholes);
 	}
 }
 
@@ -212,7 +243,7 @@ void UniverseObjects::CheckReferences()
 			Warn("conversation", it.first);
 	// The "default intro" conversation must invoke the prompt to set the player's name.
 	if(!conversations.Get("default intro")->IsValidIntro())
-		Files::LogError("Error: the \"default intro\" conversation must contain a \"name\" node.");
+		Logger::LogError("Error: the \"default intro\" conversation must contain a \"name\" node.");
 	// Effects are serialized as a part of ships.
 	for(auto &&it : effects)
 		if(it.second.Name().empty())
@@ -244,12 +275,12 @@ void UniverseObjects::CheckReferences()
 
 	// Outfit names are used by a number of classes.
 	for(auto &&it : outfits)
-		if(it.second.Name().empty())
+		if(it.second.TrueName().empty())
 			NameAndWarn("outfit", it);
 	// Outfitters are never serialized.
 	for(const auto &it : outfitSales)
 		if(it.second.empty() && !deferred["outfitter"].count(it.first))
-			Files::LogError("Warning: outfitter \"" + it.first + "\" is referred to, but has no outfits.");
+			Logger::LogError("Warning: outfitter \"" + it.first + "\" is referred to, but has no outfits.");
 	// Phrases are never serialized.
 	for(const auto &it : phrases)
 		if(it.second.Name().empty())
@@ -268,7 +299,7 @@ void UniverseObjects::CheckReferences()
 	// Shipyards are never serialized.
 	for(const auto &it : shipSales)
 		if(it.second.empty() && !deferred["shipyard"].count(it.first))
-			Files::LogError("Warning: shipyard \"" + it.first + "\" is referred to, but has no ships.");
+			Logger::LogError("Warning: shipyard \"" + it.first + "\" is referred to, but has no ships.");
 	// System names are used by a number of classes.
 	for(auto &&it : systems)
 		if(it.second.Name().empty() && !NameIfDeferred(deferred["system"], it))
@@ -277,6 +308,15 @@ void UniverseObjects::CheckReferences()
 	for(const auto &it : hazards)
 		if(!it.second.IsValid())
 			Warn("hazard", it.first);
+	// Wormholes are never serialized.
+	for(const auto &it : wormholes)
+		if(it.second.Name().empty())
+			Warn("wormhole", it.first);
+
+	// Formation patterns are not serialized, but their usage is.
+	for(auto &&it : formations)
+		if(it.second.Name().empty())
+			NameAndWarn("formation", it);
 }
 
 
@@ -289,7 +329,7 @@ void UniverseObjects::LoadFile(const string &path, bool debugMode)
 
 	DataFile data(path);
 	if(debugMode)
-		Files::LogError("Parsing: " + path);
+		Logger::LogError("Parsing: " + path);
 
 	for(const DataNode &node : data)
 	{
@@ -305,6 +345,8 @@ void UniverseObjects::LoadFile(const string &path, bool debugMode)
 			events.Get(node.Token(1))->Load(node);
 		else if(key == "fleet" && node.Size() >= 2)
 			fleets.Get(node.Token(1))->Load(node);
+		else if(key == "formation" && node.Size() >= 2)
+			formations.Get(node.Token(1))->Load(node);
 		else if(key == "galaxy" && node.Size() >= 2)
 			galaxies.Get(node.Token(1))->Load(node);
 		else if(key == "government" && node.Size() >= 2)
@@ -336,7 +378,7 @@ void UniverseObjects::LoadFile(const string &path, bool debugMode)
 		else if(key == "phrase" && node.Size() >= 2)
 			phrases.Get(node.Token(1))->Load(node);
 		else if(key == "planet" && node.Size() >= 2)
-			planets.Get(node.Token(1))->Load(node);
+			planets.Get(node.Token(1))->Load(node, wormholes);
 		else if(key == "ship" && node.Size() >= 2)
 		{
 			// Allow multiple named variants of the same ship model.
@@ -439,6 +481,24 @@ void UniverseObjects::LoadFile(const string &path, bool debugMode)
 		}
 		else if(key == "substitutions" && node.HasChildren())
 			substitutions.Load(node);
+		else if(key == "wormhole" && node.Size() >= 2)
+			wormholes.Get(node.Token(1))->Load(node);
+		else if(key == "disable" && node.Size() >= 2)
+		{
+			static const set<string> canDisable = {"mission", "event", "person"};
+			const string &category = node.Token(1);
+			if(canDisable.count(category))
+			{
+				if(node.HasChildren())
+					for(const DataNode &child : node)
+						disabled[category].emplace(child.Token(0));
+				if(node.Size() >= 3)
+					for(int index = 2; index < node.Size(); ++index)
+						disabled[category].emplace(node.Token(index));
+			}
+			else
+				node.PrintTrace("Invalid use of keyword \"disable\" for class \"" + category + "\"");
+		}
 		else
 			node.PrintTrace("Skipping unrecognized root object:");
 	}
